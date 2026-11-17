@@ -212,6 +212,16 @@ suspend fun pushSnapshot(
                 put("name", projectName)
                 put("defaultCrs", projectConfig.defaultCrs)
                 put("defaultVcrs", projectConfig.defaultVcrs)
+                putJsonArray("crsRegistry") {
+                    projectConfig.crsRegistry.forEach { entry ->
+                        add(buildJsonObject {
+                            put("id", entry.id)
+                            put("name", entry.name)
+                            put("kind", entry.kind)
+                            entry.definition?.let { put("definition", it) }
+                        })
+                    }
+                }
                 projectConfig.studyExtent?.let { extent ->
                     putJsonArray("studyExtent") {
                         extent.forEach { add(it) }

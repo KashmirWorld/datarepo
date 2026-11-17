@@ -78,7 +78,7 @@ actual fun NativeCapture(
                     y = location.latitude,
                     z = if (location.hasAltitude()) location.altitude else null,
                     crs = "EPSG:4326",
-                    vcrs = "unknown", // Do not assign a vertical reference without API evidence
+                    vcrs = if (location.hasAltitude()) "ellipsoidal" else "unknown",
                     horizontalAccuracyM = if (location.hasAccuracy()) location.accuracy.toDouble() else null,
                     verticalAccuracyM = vAccuracy,
                     source = when (location.provider) {

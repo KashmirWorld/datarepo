@@ -11,6 +11,9 @@ from kwf_geo import (
     normalize_archive,
     normalize_observation,
 )
+from gcp_transform import transform_control_point
+from imagery_link import write_imagery_link
+from spatial_exports import export_target_geoparquet, original_wkb
 
 
 def project(project_id="project-test"):
@@ -85,7 +88,7 @@ def gcps(count=5, project_id="project-test"):
     } for index, (x, y) in enumerate(points)]
 
 
-def write_boundary(path, bounds=(-95, 33, -89, 37)):
+def write_boundary(path, bounds=(-95, 33, -91, 37)):
     west, south, east, north = bounds
     path.write_text(json.dumps({
         "type": "Polygon",
@@ -104,6 +107,16 @@ def test_preserves_original_geometry(tmp_path):
     assert row["source_wkb"]
     assert row["source_crs"] == "EPSG:4326"
     assert row["geometry"].x == pytest.approx(-94.1)
+
+
+def test_source_wkb_preserves_z_only_when_height_reference_is_known():
+    record = observation()
+    vertex = record["vertices"][0]
+    vertex.update(z=125.5, vcrs="ellipsoidal")
+    assert gpd.GeoSeries.from_wkb([original_wkb(record)]).iloc[0].has_z
+
+    vertex["vcrs"] = "unknown"
+    assert not gpd.GeoSeries.from_wkb([original_wkb(record)]).iloc[0].has_z
 
 
 def test_transforms_projected_coordinates(tmp_path):
@@ -166,6 +179,53 @@ def test_real_geoparquet_metadata(tmp_path):
     assert frame.crs.to_epsg() == 4326
     assert "source_crs" in frame
     assert "source_wkb" in frame
+
+
+def test_target_crs_export_uses_original_coordinates(tmp_path):
+    root = tmp_path / "captures"
+    snapshot(root, "a", observation())
+    derived = tmp_path / "derived"
+    normalize_archive(root, derived)
+    output = tmp_path / "exports" / "observations-utm.parquet"
+
+    export_target_geoparquet(
+        derived / "observations.parquet",
+        output,
+        "EPSG:32615",
+    )
+    converted = gpd.read_parquet(output)
+    canonical = gpd.read_parquet(derived / "observations.parquet")
+    assert converted.crs.to_epsg() == 32615
+    assert converted.geometry.iloc[0].x != pytest.approx(
+        canonical.geometry.iloc[0].x
+    )
+    assert converted.source_wkb.iloc[0] == canonical.source_wkb.iloc[0]
+    assert output.with_suffix(".export.json").exists()
+
+
+def test_custom_project_crs_registry_resolves_wkt(tmp_path):
+    from pyproj import CRS
+
+    record = observation()
+    record["vertices"][0].update(
+        x=500000,
+        y=3880000,
+        crs="CUSTOM:arkansas-grid",
+    )
+    project_info = project()
+    project_info["crsRegistry"] = [{
+        "id": "CUSTOM:arkansas-grid",
+        "name": "Local grid",
+        "kind": "projected",
+        "definition": CRS.from_epsg(32615).to_wkt(),
+    }]
+    row = normalize_observation(
+        record,
+        project_info,
+        tmp_path / "source-observations.json",
+    )
+    assert row["source_crs"] == "CUSTOM:arkansas-grid"
+    assert row["geometry"].x == pytest.approx(-93, abs=0.001)
 
 
 def test_source_timestamp_and_asset_reference_survive(tmp_path):
@@ -276,13 +336,13 @@ def test_gcp_export_rejects_close_points(tmp_path):
         )
 
 
-def test_gcp_export_rejects_unimplemented_vertical_conversion(tmp_path):
+def test_gcp_export_rejects_vertical_conversion_without_required_grid(tmp_path):
     root = tmp_path / "captures"
     records = gcps()
     records[0]["vertices"][0]["vcrs"] = "EPSG:5703"
     for index, record in enumerate(records):
         snapshot(root, str(index), record)
-    with pytest.raises(ValueError, match="vertical transformation"):
+    with pytest.raises(ValueError, match="transformation unavailable"):
         export_gcps(
             root, tmp_path / "exports", "project-test", "EPSG:4326",
             "ellipsoidal", write_boundary(tmp_path / "boundary.json"),
@@ -308,3 +368,56 @@ def test_gcp_export_writes_ground_coordinates_and_references(tmp_path):
     assert metadata["targetCrs"] == "EPSG:32615"
     assert metadata["targetHeightReference"] == "ellipsoidal"
     assert metadata["points"][0]["sourceCoordinates"][2] == 100.0
+    assert metadata["verticalConversionSupported"] is True
+    assert metadata["points"][0]["transformation"]
+
+
+def test_gcp_export_uses_project_crs_defaults(tmp_path):
+    root = tmp_path / "captures"
+    config = project()
+    config["defaultCrs"] = "EPSG:32615"
+    config["defaultVcrs"] = "ellipsoidal"
+    for index, record in enumerate(gcps()):
+        snapshot(root, str(index), record, config)
+
+    directory = export_gcps(
+        root,
+        tmp_path / "exports",
+        "project-test",
+        site_boundary_path=write_boundary(tmp_path / "boundary.json"),
+    )
+    metadata = json.loads((directory / "gcp_export.json").read_text())
+    assert metadata["targetCrs"] == "EPSG:32615"
+
+
+def test_direct_3d_transform_records_operation_metadata():
+    result = transform_control_point(
+        {
+            "x": -94.1,
+            "y": 35.1,
+            "z": 100.0,
+            "crs": "EPSG:4326",
+            "vcrs": "ellipsoidal",
+        },
+        "EPSG:32615",
+        "ellipsoidal",
+    )
+    assert result.x == pytest.approx(399743.346, abs=0.01)
+    assert result.z == pytest.approx(100.0)
+    assert result.description
+
+
+def test_imagery_link_manifest_contains_gcp_export_id(tmp_path):
+    export = tmp_path / "gcp"
+    export.mkdir()
+    (export / "gcp_export.json").write_text(
+        json.dumps({"exportId": "export-123"}), encoding="utf-8"
+    )
+    output = write_imagery_link(
+        export,
+        "ortho-1",
+        "s3://bucket/ortho.tif",
+        tmp_path / "handoff" / "imagery-link.json",
+    )
+    document = json.loads(output.read_text())
+    assert document["imagery"]["gcp_export_id"] == "export-123"

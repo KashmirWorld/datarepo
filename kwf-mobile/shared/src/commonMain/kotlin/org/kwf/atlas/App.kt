@@ -258,6 +258,8 @@ fun Observation.toFeatureOrNull(assetPrefix: String): JsonObject? {
                 vertices.forEach {
                     add(buildJsonObject {
                         put("source", it.source)
+                        put("x", it.longitude)
+                        put("y", it.latitude)
                         it.accuracyMeters?.let { accuracy ->
                             put("accuracyMeters", accuracy)
                         }
@@ -313,6 +315,16 @@ private fun saveProjectTypes(entries: List<ObservationTypeEntry>) {
     storage.putString("project_types_json", codec.encodeToString(entries))
 }
 
+private fun loadProjectCrsRegistry(): List<CrsEntry> {
+    val raw = storage.getString("project_crs_registry_json", "")
+    if (raw.isBlank()) return emptyList()
+    return runCatching {
+        codec.decodeFromString<List<CrsEntry>>(raw)
+    }.getOrElse { error ->
+        throw IllegalStateException("Project CRS registry could not be loaded.", error)
+    }
+}
+
 @Composable
 fun App() {
     val scope = rememberCoroutineScope()
@@ -346,9 +358,15 @@ fun App() {
     }
 
     var projectTypes by remember { mutableStateOf(loadProjectTypes()) }
+    var projectCrsRegistry by remember { mutableStateOf(loadProjectCrsRegistry()) }
     var showAddTypeDialog by remember { mutableStateOf(false) }
     var newTypeName by remember { mutableStateOf("") }
     var newSubtypeName by remember { mutableStateOf("") }
+    var showAddCrsDialog by remember { mutableStateOf(false) }
+    var newCrsId by remember { mutableStateOf("CUSTOM:1") }
+    var newCrsName by remember { mutableStateOf("") }
+    var newCrsKind by remember { mutableStateOf("projected") }
+    var newCrsDefinition by remember { mutableStateOf("") }
 
     var type by remember { mutableStateOf("GCP") }
     var subtype by remember { mutableStateOf("Survey target") }
@@ -360,6 +378,7 @@ fun App() {
     var manualZ by remember { mutableStateOf("") }
     var manualCrs by remember { mutableStateOf(defaultCrs) }
     var manualVcrs by remember { mutableStateOf("unknown") }
+    var manualEpoch by remember { mutableStateOf("") }
     var manualAccuracyM by remember { mutableStateOf("") }
     var manualVAccuracyM by remember { mutableStateOf("") }
 
@@ -370,8 +389,6 @@ fun App() {
     var soilPh by remember { mutableStateOf("") }
     var moisture by remember { mutableStateOf("") }
     var moistureUnit by remember { mutableStateOf("%") }
-    var customMoistureUnit by remember { mutableStateOf("") }
-    var useCustomMoistureUnit by remember { mutableStateOf(false) }
 
     var surveyed by remember { mutableStateOf(false) }
     var surveyReference by remember { mutableStateOf("") }
@@ -439,13 +456,18 @@ fun App() {
 
     val parsedStudyExtent = runCatching { parseStudyExtent(studyExtentText) }
     val studyExtentError = parsedStudyExtent.exceptionOrNull()?.message
+    val crsEntries = (FieldOptions.initialCrsEntries + projectCrsRegistry)
+        .distinctBy { it.id }
+    val crsChoices = crsEntries.map { it.id to "${it.id} · ${it.name}" }
+    val heightChoices = FieldOptions.heightReferences.map { it to it }
     val currentProjectConfig = ProjectConfig(
         id = projectId,
         name = project.trim(),
         defaultCrs = defaultCrs,
         defaultVcrs = defaultVcrs,
         studyExtent = parsedStudyExtent.getOrNull(),
-        types = projectTypes
+        types = projectTypes,
+        crsRegistry = projectCrsRegistry
     )
 
     fun draft(): Observation = Observation(
@@ -463,10 +485,7 @@ fun App() {
         notes = notes,
         soilPh = parsedNumber(soilPh, "Soil pH"),
         moisture = parsedNumber(moisture, "Moisture"),
-        moistureUnit = if (moisture.isNotBlank()) {
-            if (useCustomMoistureUnit) customMoistureUnit.trim()
-            else moistureUnit
-        } else null,
+        moistureUnit = moistureUnit.takeIf { moisture.isNotBlank() },
         surveyed = surveyed,
         surveyReference = surveyReference.trim(),
         elevationMeters = parsedNumber(elevation, "Elevation"),
@@ -504,12 +523,11 @@ fun App() {
         manualX = ""
         manualY = ""
         manualZ = ""
+        manualEpoch = ""
         notes = ""
         soilPh = ""
         moisture = ""
         moistureUnit = "%"
-        customMoistureUnit = ""
-        useCustomMoistureUnit = false
         surveyReference = ""
         elevation = ""
         datum = "unknown"
@@ -530,22 +548,14 @@ fun App() {
         notes = record.notes
         soilPh = record.soilPh?.toString().orEmpty()
         moisture = record.moisture?.toString().orEmpty()
-        val knownMoistureUnits = setOf("%", "m³/m³", "cb")
-        useCustomMoistureUnit =
-            record.moistureUnit != null && record.moistureUnit !in knownMoistureUnits
-        moistureUnit = record.moistureUnit
-            ?.takeIf { it in knownMoistureUnits } ?: "%"
-        customMoistureUnit = if (useCustomMoistureUnit) {
-            record.moistureUnit.orEmpty()
-        } else {
-            ""
-        }
+        moistureUnit = record.moistureUnit ?: "%"
         surveyed = record.surveyed
         surveyReference = record.surveyReference
         elevation = record.elevationMeters?.toString().orEmpty()
         datum = record.verticalDatum
         photos = record.photosBase64
         manualCrs = record.vertices.firstOrNull()?.crs ?: defaultCrs
+        manualEpoch = record.vertices.firstOrNull()?.coordinateEpoch?.toString().orEmpty()
         step = 0
         selectedRecord = null
         screen = "capture"
@@ -659,14 +669,35 @@ fun App() {
                                 style = MaterialTheme.typography.bodySmall,
                                 color = colors.onSurfaceVariant
                             )
-                            AtlasField(
-                                defaultCrs,
-                                {
+                            FieldChoice(
+                                label = "Default horizontal CRS",
+                                value = defaultCrs,
+                                choices = crsChoices,
+                                onSelected = {
                                     defaultCrs = it.trim()
                                     if (vertices.isEmpty()) manualCrs = defaultCrs
                                     storage.putString("project_default_crs", defaultCrs)
                                 },
-                                "Default Horizontal CRS (e.g. EPSG:4326)"
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            FieldChoice(
+                                label = "Default height reference",
+                                value = defaultVcrs,
+                                choices = heightChoices,
+                                onSelected = {
+                                    defaultVcrs = it
+                                    storage.putString("project_default_vcrs", it)
+                                },
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            TextButton(onClick = { showAddCrsDialog = true }) {
+                                Text("+ Add project CRS")
+                            }
+                            Text(
+                                "Custom CRS definitions are used for server-side normalization; " +
+                                    "the phone records the selected source coordinates.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = colors.onSurfaceVariant
                             )
                             AtlasField(
                                 studyExtentText,
@@ -763,40 +794,39 @@ fun App() {
                                 )
 
                                 AtlasCard {
-                                    Text("CATEGORY TYPE", style = MaterialTheme.typography.labelSmall)
-                                    Row(
-                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                                    ) {
-                                        projectTypes.forEach { entry ->
-                                            FilterChip(
-                                                selected = type == entry.type,
-                                                onClick = {
-                                                    type = entry.type
-                                                    subtype = entry.subtypes.firstOrNull() ?: ""
-                                                },
-                                                label = { Text(entry.type) }
-                                            )
+                                    val typeChoices = projectTypes
+                                        .map { it.type to it.type }
+                                        .let { choices ->
+                                            if (choices.any { it.first == type }) choices
+                                            else choices + (type to "$type · existing record")
                                         }
-                                    }
-
+                                    FieldChoice(
+                                        label = "Category type",
+                                        value = type,
+                                        choices = typeChoices,
+                                        onSelected = {
+                                            type = it
+                                            subtype = projectTypes
+                                                .firstOrNull { entry -> entry.type == it }
+                                                ?.subtypes?.firstOrNull().orEmpty()
+                                        }
+                                    )
                                     val currentEntry = projectTypes.firstOrNull { it.type == type }
-                                    if (currentEntry != null && currentEntry.subtypes.isNotEmpty()) {
-                                        Text("SUBTYPE", style = MaterialTheme.typography.labelSmall)
-                                        Row(
-                                            horizontalArrangement = Arrangement.spacedBy(6.dp)
-                                        ) {
-                                            currentEntry.subtypes.forEach { sub ->
-                                                FilterChip(
-                                                    selected = subtype == sub,
-                                                    onClick = { subtype = sub },
-                                                    label = { Text(sub) }
-                                                )
+                                    val subtypeChoices = currentEntry?.subtypes.orEmpty()
+                                        .map { it to it }
+                                        .let { choices ->
+                                            if (subtype.isBlank() || choices.any { it.first == subtype }) {
+                                                choices
+                                            } else {
+                                                choices + (subtype to "$subtype · existing record")
                                             }
                                         }
-                                    }
-
-                                    AtlasField(type, { type = it.take(120) }, "Type name")
-                                    AtlasField(subtype, { subtype = it.take(120) }, "Subtype name")
+                                    FieldChoice(
+                                        label = "Subtype",
+                                        value = subtype,
+                                        choices = subtypeChoices,
+                                        onSelected = { subtype = it }
+                                    )
 
                                     TextButton(onClick = { showAddTypeDialog = true }) {
                                         Text("+ Add new category / subtype to project")
@@ -909,20 +939,27 @@ fun App() {
                                     AtlasField(manualX, { manualX = it }, "x (Easting / Longitude)")
                                     AtlasField(manualY, { manualY = it }, "y (Northing / Latitude)")
                                     AtlasField(manualZ, { manualZ = it }, "z (Elevation / Height) · optional")
-                                    AtlasField(manualCrs, { manualCrs = it.trim() }, "Horizontal CRS (e.g. EPSG:4326)")
-
-                                    Text("HEIGHT REFERENCE (VCRS)", style = MaterialTheme.typography.labelSmall)
-                                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                        listOf("unknown", "ellipsoidal", "EPSG:5703", "EPSG:5714").forEach { ref ->
-                                            FilterChip(
-                                                selected = manualVcrs == ref,
-                                                onClick = { manualVcrs = ref },
-                                                label = { Text(ref) }
-                                            )
-                                        }
-                                    }
+                                    FieldChoice(
+                                        label = "Horizontal CRS",
+                                        value = manualCrs,
+                                        choices = crsChoices,
+                                        onSelected = { manualCrs = it },
+                                        modifier = Modifier.fillMaxWidth()
+                                    )
+                                    FieldChoice(
+                                        label = "Height reference",
+                                        value = manualVcrs,
+                                        choices = heightChoices,
+                                        onSelected = { manualVcrs = it },
+                                        modifier = Modifier.fillMaxWidth()
+                                    )
 
                                     if (surveyed) {
+                                        AtlasField(
+                                            manualEpoch,
+                                            { manualEpoch = it },
+                                            "Coordinate epoch · when required by this CRS"
+                                        )
                                         AtlasField(manualAccuracyM, { manualAccuracyM = it }, "Horizontal Accuracy (meters)")
                                         AtlasField(manualVAccuracyM, { manualVAccuracyM = it }, "Vertical Accuracy (meters)")
                                     }
@@ -935,6 +972,7 @@ fun App() {
                                                 val y = parsedNumber(manualY, "y (Northing/Latitude)")
                                                     ?: error("y coordinate is required.")
                                                 val z = parsedNumber(manualZ, "z (Elevation)")
+                                                val epoch = parsedNumber(manualEpoch, "Coordinate epoch")
                                                 val hAcc = parsedNumber(manualAccuracyM, "Horizontal accuracy")
                                                 val vAcc = parsedNumber(manualVAccuracyM, "Vertical accuracy")
 
@@ -954,6 +992,7 @@ fun App() {
                                                         crs = manualCrs.ifBlank { "EPSG:4326" },
                                                         vcrs = manualVcrs.ifBlank { "unknown" },
                                                         verticalAccuracyM = vAcc,
+                                                        coordinateEpoch = epoch,
                                                         capturedAtEpochMs = nowMillis(),
                                                         provider = null
                                                     )
@@ -995,16 +1034,13 @@ fun App() {
                                         "Elevation in meters · optional"
                                     )
 
-                                    Text("VERTICAL REFERENCE CHOICE", style = MaterialTheme.typography.labelSmall)
-                                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                        listOf("unknown", "ellipsoidal", "EPSG:5703", "EPSG:5714", "EPSG:3855").forEach { choice ->
-                                            FilterChip(
-                                                selected = datum == choice,
-                                                onClick = { datum = choice },
-                                                label = { Text(choice) }
-                                            )
-                                        }
-                                    }
+                                    FieldChoice(
+                                        label = "Elevation height reference",
+                                        value = datum,
+                                        choices = heightChoices,
+                                        onSelected = { datum = it },
+                                        modifier = Modifier.fillMaxWidth()
+                                    )
                                 }
                             }
 
@@ -1057,31 +1093,24 @@ fun App() {
                                         AtlasField(soilPh, { soilPh = it }, "Soil pH (0–14)")
                                         AtlasField(moisture, { moisture = it }, "Moisture value")
                                         if (moisture.isNotBlank()) {
-                                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                                listOf("%", "m³/m³", "cb").forEach { unit ->
-                                                    FilterChip(
-                                                        selected = !useCustomMoistureUnit &&
-                                                            moistureUnit == unit,
-                                                        onClick = {
-                                                            moistureUnit = unit
-                                                            useCustomMoistureUnit = false
-                                                        },
-                                                        label = { Text(unit) }
-                                                    )
+                                            val units = (FieldOptions.moistureUnits +
+                                                listOf("%", "m³/m³", "cb"))
+                                                .distinct()
+                                                .map { it to it }
+                                                .let { choices ->
+                                                    if (choices.any { it.first == moistureUnit }) choices
+                                                    else choices + (
+                                                        moistureUnit to
+                                                            "$moistureUnit · legacy value"
+                                                        )
                                                 }
-                                                FilterChip(
-                                                    selected = useCustomMoistureUnit,
-                                                    onClick = { useCustomMoistureUnit = true },
-                                                    label = { Text("Custom unit…") }
-                                                )
-                                            }
-                                            if (useCustomMoistureUnit) {
-                                                AtlasField(
-                                                    customMoistureUnit,
-                                                    { customMoistureUnit = it.take(40) },
-                                                    "Custom moisture unit · required"
-                                                )
-                                            }
+                                            FieldChoice(
+                                                label = "Moisture unit",
+                                                value = moistureUnit,
+                                                choices = units,
+                                                onSelected = { moistureUnit = it },
+                                                modifier = Modifier.fillMaxWidth()
+                                            )
                                         }
                                     } else {
                                         TextButton(onClick = { type = "Soil" }) {
@@ -1469,6 +1498,83 @@ fun App() {
                 },
                 dismissButton = {
                     TextButton(onClick = { showAddTypeDialog = false }) {
+                        Text("Cancel")
+                    }
+                }
+            )
+        }
+
+        if (showAddCrsDialog) {
+            AlertDialog(
+                onDismissRequest = { showAddCrsDialog = false },
+                title = { Text("Add project CRS") },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        AtlasField(newCrsId, { newCrsId = it.trim() }, "Identifier (CUSTOM:1)")
+                        AtlasField(newCrsName, { newCrsName = it }, "Display name")
+                        FieldChoice(
+                            label = "CRS kind",
+                            value = newCrsKind,
+                            choices = listOf(
+                                "geographic" to "Geographic",
+                                "projected" to "Projected",
+                                "vertical" to "Vertical",
+                                "compound" to "Compound"
+                            ),
+                            onSelected = { newCrsKind = it }
+                        )
+                        AtlasField(
+                            newCrsDefinition,
+                            { newCrsDefinition = it },
+                            "CRS definition (WKT2 or PROJJSON)",
+                            multiline = true
+                        )
+                    }
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            attempt {
+                                require(newCrsId.matches(
+                                    Regex("""^CUSTOM:[A-Za-z0-9._-]{1,100}$""")
+                                )) { "Custom CRS identifiers must use CUSTOM:<name>." }
+                                require(newCrsName.isNotBlank()) {
+                                    "CRS display name is required."
+                                }
+                                require(newCrsDefinition.isNotBlank()) {
+                                    "A WKT2 or PROJJSON definition is required."
+                                }
+                                require(crsEntries.none { it.id == newCrsId }) {
+                                    "That CRS identifier is already registered."
+                                }
+                                val entry = CrsEntry(
+                                    id = newCrsId,
+                                    name = newCrsName.trim(),
+                                    kind = newCrsKind,
+                                    definition = newCrsDefinition.trim()
+                                )
+                                val updated = projectCrsRegistry + entry
+                                projectCrsRegistry = updated
+                                storage.putString(
+                                    "project_crs_registry_json",
+                                    codec.encodeToString(updated)
+                                )
+                                defaultCrs = entry.id
+                                manualCrs = entry.id
+                                storage.putString("project_default_crs", entry.id)
+                                newCrsId = "CUSTOM:${updated.size + 1}"
+                                newCrsName = ""
+                                newCrsDefinition = ""
+                                showAddCrsDialog = false
+                                notify("Project CRS registered for server-side normalization.")
+                            }
+                        }
+                    ) {
+                        Text("Add CRS")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showAddCrsDialog = false }) {
                         Text("Cancel")
                     }
                 }

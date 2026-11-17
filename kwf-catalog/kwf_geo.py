@@ -76,9 +76,14 @@ def epoch_iso(value):
 def resolve_crs(identifier, project=None):
     if not isinstance(identifier, str) or not identifier.strip():
         raise ValueError("Missing CRS")
-    definition = (project or {}).get("crsRegistry", {}).get(
-        identifier, identifier
-    )
+    registry = (project or {}).get("crsRegistry", {})
+    if isinstance(registry, list):
+        registry = {
+            entry["id"]: entry
+            for entry in registry
+            if isinstance(entry, dict) and isinstance(entry.get("id"), str)
+        }
+    definition = registry.get(identifier, identifier)
     if isinstance(definition, dict):
         definition = definition.get("definition")
     try:
@@ -239,10 +244,10 @@ def legacy_observation(feature, project):
     for index, coordinate in enumerate(points):
         item = metadata[index] if index < len(metadata) else {}
         vertices.append({
-            "x": coordinate[0],
-            "y": coordinate[1],
+            "x": item.get("x", coordinate[0]),
+            "y": item.get("y", coordinate[1]),
             "z": item.get("z", coordinate[2] if len(coordinate) > 2 else None),
-            "crs": "EPSG:4326",
+            "crs": item.get("crs", "EPSG:4326"),
             "vcrs": item.get("vcrs", "unknown"),
             "source": item.get("source", "unknown"),
             "horizontalAccuracyM": item.get(
@@ -251,6 +256,7 @@ def legacy_observation(feature, project):
             ),
             "verticalAccuracyM": item.get("verticalAccuracyM"),
             "capturedAtEpochMs": item.get("capturedAtEpochMs"),
+            "coordinateEpoch": item.get("coordinateEpoch"),
             "provider": item.get("provider"),
         })
     timestamp = properties.get(
@@ -443,6 +449,8 @@ def normalize_observation(observation, project, source_path):
     })
     west, south, east, north = display.bounds
     center = display.centroid
+    from spatial_exports import original_wkb
+
     return {
         "id": str(observation["id"]),
         "revision": observation.get("revision", 1),
@@ -453,7 +461,7 @@ def normalize_observation(observation, project, source_path):
         "observed_at_epoch_ms": observation.get("observedAtEpochMs"),
         "source_crs": source_id,
         "source_crs_wkt": source_crs.to_wkt(),
-        "source_wkb": original.wkb,
+        "source_wkb": original_wkb(observation),
         "source_vertices_json": json.dumps(observation["vertices"]),
         "properties_json": json.dumps(properties, allow_nan=False),
         "record_hash": digest(observation),
@@ -534,28 +542,25 @@ def vertical_unit_factor(reference):
 
 
 def export_gcps(
-    root, output, project_id, target_crs_id, target_vcrs_id,
-    site_boundary_path, metric_crs_id, minimum_points=5,
+    root, output, project_id, target_crs_id=None, target_vcrs_id=None,
+    site_boundary_path=None, metric_crs_id=None, minimum_points=5,
     minimum_hull_area_m2=10.0, minimum_separation_m=1.0,
 ):
+    from gcp_target import select_metric_crs, select_target
+    from gcp_transform import (
+        accuracy_in_output_units,
+        full_crs,
+        transform_control_point,
+    )
+
     latest, projects, problems = load_latest(root)
     if problems:
         raise ValueError("Resolve snapshot conflicts/loading errors before GCP export")
     if project_id not in projects:
         raise ValueError("Unknown project")
+    if site_boundary_path is None:
+        raise ValueError("A WGS 84 site boundary is required")
     project = projects[project_id]
-    target = resolve_crs(target_crs_id, project)
-    metric = resolve_crs(metric_crs_id, project)
-    if not (target.is_geographic or target.is_projected):
-        raise ValueError("Target must be a horizontal CRS")
-    if not metric.is_projected or any(
-        abs(axis.unit_conversion_factor - 1.0) > 1e-12
-        for axis in metric.axis_info[:2]
-    ):
-        raise ValueError("Quality-check CRS must be projected in meters")
-    if target_vcrs_id == "unknown":
-        raise ValueError("Target height reference cannot be unknown")
-    height_factor = vertical_unit_factor(target_vcrs_id)
     boundary_json = read_json(site_boundary_path)
     if boundary_json.get("crs"):
         raise ValueError("Boundary must be RFC 7946 WGS 84 GeoJSON")
@@ -575,6 +580,7 @@ def export_gcps(
         and -90 <= bounds[1] <= bounds[3] <= 90
     ):
         raise ValueError("Boundary must use WGS 84 coordinates")
+
     candidates = []
     warnings = []
     for item in latest:
@@ -591,10 +597,50 @@ def export_gcps(
         raise ValueError(
             f"Project policy requires at least {minimum_points} surveyed GCPs"
         )
+
+    first_vertex = candidates[0]["observation"]["vertices"][0]
+    first_source = resolve_crs(first_vertex["crs"], project)
+    target_crs_id, target_vcrs_id = select_target(
+        project,
+        target_crs_id,
+        target_vcrs_id,
+        first_source.to_wkt(),
+        bounds,
+    )
+    target = resolve_crs(target_crs_id, project)
+    if not (target.is_geographic or target.is_projected):
+        raise ValueError("Target must be a horizontal CRS")
+
+    metric_crs_id = metric_crs_id or select_metric_crs(
+        first_source.to_wkt(), bounds
+    )
+    metric = resolve_crs(metric_crs_id, project)
+    if not metric.is_projected or any(
+        abs(axis.unit_conversion_factor - 1.0) > 1e-12
+        for axis in metric.axis_info[:2]
+    ):
+        raise ValueError("Quality-check CRS must be projected in meters")
+
+    for longitude, latitude in (
+        (bounds[0], bounds[1]),
+        (bounds[0], bounds[3]),
+        (bounds[2], bounds[1]),
+        (bounds[2], bounds[3]),
+    ):
+        if not in_area(longitude, latitude, target):
+            raise ValueError("Target CRS area of use does not cover the site")
+
     labels = set()
     exported = []
     metric_points = []
     provenance = []
+    target_height_definition = (
+        target_vcrs_id
+        if target_vcrs_id == "ellipsoidal"
+        else resolve_crs(target_vcrs_id, project).to_wkt()
+    )
+    target_full_crs = full_crs(target.to_wkt(), target_height_definition)
+
     for item in candidates:
         observation = item["observation"]
         label = str(observation.get("gcpLabel") or "").strip()
@@ -608,29 +654,15 @@ def export_gcps(
         vertex = observation["vertices"][0]
         if vertex.get("source") not in {"manual", "survey"}:
             raise ValueError(f"{label}: invalid survey source")
-        if vertex.get("coordinateEpoch") is not None:
-            raise ValueError(f"{label}: epoch-dependent transformation not implemented")
-        if vertex.get("vcrs") != target_vcrs_id:
-            raise ValueError(
-                f"{label}: vertical transformation is required but is not "
-                "implemented in this release. Do not relabel the height."
-            )
         x = finite(vertex.get("x"), f"{label} x")
         y = finite(vertex.get("y"), f"{label} y")
-        z = finite(vertex.get("z"), f"{label} z")
+        finite(vertex.get("z"), f"{label} z")
         h_accuracy = finite(vertex.get("horizontalAccuracyM"), "Horizontal accuracy")
         v_accuracy = finite(vertex.get("verticalAccuracyM"), "Vertical accuracy")
         if h_accuracy < 0 or v_accuracy < 0:
             raise ValueError("Accuracy cannot be negative")
+
         source = resolve_crs(vertex["crs"], project)
-        if (
-            target_vcrs_id == "ellipsoidal"
-            and not source.geodetic_crs.equals(target.geodetic_crs)
-        ):
-            raise ValueError(
-                "Ellipsoidal heights across different horizontal datums "
-                "require a verified 3D transformation"
-            )
         display_operation = transformer(source, CRS.from_epsg(4326))
         longitude, latitude = display_operation.transform(x, y, errcheck=True)
         if not boundary.covers(Point(longitude, latitude)):
@@ -639,17 +671,34 @@ def export_gcps(
             raise ValueError(f"{label}: outside target CRS area")
         if not in_area(longitude, latitude, metric):
             raise ValueError(f"{label}: outside metric CRS area")
-        operation = transformer(source, target)
-        tx, ty = operation.transform(x, y, errcheck=True)
+
+        converted = transform_control_point(
+            vertex,
+            target.to_wkt(),
+            target_height_definition,
+            source_definition=source.to_wkt(),
+            source_height_reference=(
+                vertex["vcrs"]
+                if vertex["vcrs"] == "ellipsoidal"
+                else resolve_crs(vertex["vcrs"], project).to_wkt()
+            ),
+        )
         mx, my = transformer(source, metric).transform(x, y, errcheck=True)
-        for value in (tx, ty, mx, my):
+        for value in (converted.x, converted.y, mx, my):
             finite(value, "Transformed coordinate")
+        output_h_accuracy, output_v_accuracy = accuracy_in_output_units(
+            h_accuracy, v_accuracy, target.to_wkt(), target_height_definition
+        )
         metric_points.append(Point(mx, my))
         exported.append({
-            "name": label, "x": tx, "y": ty, "z": z,
-            "h_accuracy": h_accuracy,
-            "v_accuracy": v_accuracy / height_factor,
-            "longitude": longitude, "latitude": latitude,
+            "name": label,
+            "x": converted.x,
+            "y": converted.y,
+            "z": converted.z,
+            "h_accuracy": output_h_accuracy,
+            "v_accuracy": output_v_accuracy,
+            "longitude": longitude,
+            "latitude": latitude,
             "id": observation["id"],
         })
         provenance.append({
@@ -657,18 +706,26 @@ def export_gcps(
             "revision": observation.get("revision", 1),
             "label": label,
             "sourceCrs": vertex["crs"],
-            "sourceCoordinates": [x, y, z],
+            "sourceCrsWkt": source.to_wkt(),
+            "sourceCoordinates": [x, y, vertex["z"]],
             "sourceHeightReference": vertex["vcrs"],
+            "coordinateEpoch": vertex.get("coordinateEpoch"),
+            "outputCoordinateEpoch": converted.output_epoch,
             "surveyReference": observation["surveyReference"],
-            "transformation": operation.description,
-            "verticalTransformation": "Identity: matching height references",
+            "transformation": converted.description,
+            "transformationAccuracyM": converted.operation_accuracy_m,
+            "grids": converted.grids,
         })
+
     if MultiPoint(metric_points).convex_hull.area < minimum_hull_area_m2:
         raise ValueError("GCP layout fails configured hull-area threshold")
     for index, point in enumerate(metric_points):
-        if any(point.distance(other) < minimum_separation_m
-               for other in metric_points[index + 1:]):
+        if any(
+            point.distance(other) < minimum_separation_m
+            for other in metric_points[index + 1:]
+        ):
             raise ValueError("GCPs fail configured separation threshold")
+
     export_id = str(uuid.uuid4())
     directory = output / export_id
     directory.mkdir(parents=True, exist_ok=False)
@@ -680,14 +737,18 @@ def export_gcps(
         precision = 9 if target.is_geographic else 3
         for point in exported:
             writer.writerow([
-                point["name"], f'{point["x"]:.{precision}f}',
-                f'{point["y"]:.{precision}f}', f'{point["z"]:.3f}',
-                f'{point["h_accuracy"]:.3f}', f'{point["v_accuracy"]:.3f}',
+                point["name"],
+                f'{point["x"]:.{precision}f}',
+                f'{point["y"]:.{precision}f}',
+                f'{point["z"]:.3f}',
+                f'{point["h_accuracy"]:.3f}',
+                f'{point["v_accuracy"]:.3f}',
             ])
     write_json(directory / "gcp_points.geojson", {
         "type": "FeatureCollection",
         "features": [{
-            "type": "Feature", "id": point["id"],
+            "type": "Feature",
+            "id": point["id"],
             "geometry": {
                 "type": "Point",
                 "coordinates": [point["longitude"], point["latitude"]],
@@ -702,15 +763,15 @@ def export_gcps(
         "targetCrs": target_crs_id,
         "targetCrsWkt": target.to_wkt(),
         "targetHeightReference": target_vcrs_id,
-        "horizontalAccuracyUnit": "meter",
-        "verticalAccuracyUnit": (
-            "meter" if target_vcrs_id == "ellipsoidal"
-            else resolve_crs(target_vcrs_id).axis_info[0].unit_name
+        "targetCompoundCrsWkt": target_full_crs.to_wkt(),
+        "horizontalAccuracyUnit": (
+            "meter" if target.is_geographic else target.axis_info[0].unit_name
         ),
+        "verticalAccuracyUnit": target_full_crs.axis_info[2].unit_name,
         "points": provenance,
         "warnings": warnings,
         "imagePixelCorrespondencesIncluded": False,
-        "verticalConversionSupported": False,
+        "verticalConversionSupported": True,
     })
     return directory
 
@@ -721,24 +782,48 @@ def main():
     normalize = commands.add_parser("normalize")
     normalize.add_argument("--captures", type=Path, default=CAPTURES)
     normalize.add_argument("--output", type=Path, default=DERIVED)
+    export_crs = commands.add_parser("export-crs")
+    export_crs.add_argument(
+        "--input", type=Path, default=DERIVED / "observations.parquet"
+    )
+    export_crs.add_argument("--output", type=Path, required=True)
+    export_crs.add_argument("--target-crs", required=True)
     gcps = commands.add_parser("gcps")
     gcps.add_argument("--captures", type=Path, default=CAPTURES)
     gcps.add_argument("--output", type=Path, default=DERIVED / "gcp-exports")
     gcps.add_argument("--project-id", required=True)
-    gcps.add_argument("--target-crs", required=True)
-    gcps.add_argument("--target-vcrs", required=True)
+    gcps.add_argument("--target-crs")
+    gcps.add_argument("--target-vcrs")
     gcps.add_argument("--site-boundary", type=Path, required=True)
-    gcps.add_argument("--metric-crs", required=True)
+    gcps.add_argument("--metric-crs")
+    imagery = commands.add_parser("imagery-link")
+    imagery.add_argument("--gcp-export", type=Path, required=True)
+    imagery.add_argument("--imagery-id", required=True)
+    imagery.add_argument("--file-uri", required=True)
+    imagery.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.command == "normalize":
         frame = normalize_archive(args.captures, args.output)
         print(f"Normalized {len(frame)} observations")
-    else:
+    elif args.command == "export-crs":
+        from spatial_exports import export_target_geoparquet
+
+        print(export_target_geoparquet(args.input, args.output, args.target_crs))
+    elif args.command == "gcps":
         result = export_gcps(
             args.captures, args.output, args.project_id, args.target_crs,
             args.target_vcrs, args.site_boundary, args.metric_crs,
         )
         print(result)
+    else:
+        from imagery_link import write_imagery_link
+
+        print(write_imagery_link(
+            args.gcp_export,
+            args.imagery_id,
+            args.file_uri,
+            args.output,
+        ))
 
 
 if __name__ == "__main__":

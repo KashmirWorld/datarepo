@@ -40,15 +40,16 @@ private class LocationDelegate : NSObject(), CLLocationManagerDelegateProtocol {
             if (location.horizontalAccuracy < 0) continue
             val latitude = location.coordinate.useContents { latitude }
             val longitude = location.coordinate.useContents { longitude }
+            val hasEllipsoidalHeight = location.verticalAccuracy >= 0
             val vertex = Vertex(
                 longitude = longitude,
                 latitude = latitude,
                 source = "platform-derived",
                 accuracyMeters = location.horizontalAccuracy,
-                z = if (location.verticalAccuracy >= 0) location.altitude else null,
+                z = if (hasEllipsoidalHeight) location.ellipsoidalAltitude else null,
                 crs = "EPSG:4326",
-                vcrs = "unknown",
-                verticalAccuracyM = if (location.verticalAccuracy >= 0) {
+                vcrs = if (hasEllipsoidalHeight) "ellipsoidal" else "unknown",
+                verticalAccuracyM = if (hasEllipsoidalHeight) {
                     location.verticalAccuracy
                 } else null,
                 capturedAtEpochMs =

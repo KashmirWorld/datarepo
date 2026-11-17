@@ -102,6 +102,7 @@ data class ProjectConfig(
     val defaultVcrs: String = "unknown",
     val studyExtent: List<Double>? = null,
     val types: List<ObservationTypeEntry> = emptyList(),
+    val crsRegistry: List<CrsEntry> = emptyList(),
 )
 
 @Serializable
@@ -130,7 +131,7 @@ data class BatchManifest(
  */
 object SpatialContract {
 
-    private val crsPattern = Regex("""^[A-Z]+:\d+$""")
+    private val crsPattern = Regex("""^(?:[A-Z]+:\d+|CUSTOM:[A-Za-z0-9._-]{1,100})$""")
 
     fun validate(
         observation: SourceObservation,
@@ -185,6 +186,11 @@ object SpatialContract {
                 vertex.crs == "EPSG:4326" ||
                 crsPattern.matches(vertex.crs)
             ) { "Invalid horizontal CRS: ${vertex.crs}" }
+            if (vertex.crs.startsWith("CUSTOM:")) {
+                require(project?.crsRegistry?.any { it.id == vertex.crs } == true) {
+                    "Custom CRS is missing from the project registry: ${vertex.crs}"
+                }
+            }
             if (vertex.crs == "EPSG:4326") {
                 require(vertex.x in -180.0..180.0 && vertex.y in -90.0..90.0) {
                     "WGS 84 coordinates must be longitude [-180, 180] and latitude [-90, 90]."
@@ -202,6 +208,11 @@ object SpatialContract {
                 vertex.vcrs == "ellipsoidal" ||
                 crsPattern.matches(vertex.vcrs)
             ) { "Invalid height reference." }
+            if (vertex.vcrs.startsWith("CUSTOM:")) {
+                require(project?.crsRegistry?.any { it.id == vertex.vcrs } == true) {
+                    "Custom height reference is missing from the project registry: ${vertex.vcrs}"
+                }
+            }
         }
 
         val distinct = observation.vertices
